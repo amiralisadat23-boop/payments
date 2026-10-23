@@ -1,0 +1,84 @@
+﻿from django.views.decorators.http import require_GET
+import requests
+
+from django.conf import settings
+from django.shortcuts import redirect
+from django.http import HttpResponse
+from django.urls import reverse
+
+from .models import Payment
+
+
+def send_request(request):
+    payment = Payment.objects.create(amount=10000)
+
+    data = {
+        "merchant_id": settings.MERCHANT,
+        "amount": payment.amount * 10,
+        "callback_url": request.build_absolute_uri(
+            reverse("payment_verify")
+        ),
+        "description": "Test payment",
+    }
+
+    url = "https://sandbox.zarinpal.com/pg/v4/payment/request.json"
+
+    try:
+        response = requests.post(url, json=data, timeout=15)
+        result = response.json()
+    except (requests.RequestException, ValueError):
+        return HttpResponse("Connection to payment gateway failed.")
+
+    authority = result.get("data", {}).get("authority")
+    if result.get("data", {}).get("code") == 100 and authority:
+        payment.authority = authority
+        payment.save()
+        return redirect(
+            f"https://sandbox.zarinpal.com/pg/StartPay/{authority}"
+        )
+
+    return HttpResponse(
+        f"Payment request failed. HTTP {response.status_code}: {result}",
+        status=502,
+    )
+
+
+@require_GET
+def verify_payment(request):
+    authority = request.GET.get("Authority")
+    status = request.GET.get("Status")
+
+    if not authority or status != "OK":
+        return HttpResponse("Payment was cancelled or failed.")
+
+    try:
+        payment = Payment.objects.get(authority=authority)
+    except Payment.DoesNotExist:
+        return HttpResponse("Payment not found.", status=404)
+
+    if payment.is_paid:
+        return HttpResponse("This payment was already verified.")
+
+    data = {
+        "merchant_id": settings.MERCHANT,
+        "amount": payment.amount * 10,
+        "authority": authority,
+    }
+
+    url = "https://sandbox.zarinpal.com/pg/v4/payment/verify.json"
+
+    try:
+        response = requests.post(url, json=data, timeout=15)
+        result = response.json()
+    except (requests.RequestException, ValueError):
+        return HttpResponse("Verification service unavailable.", status=502)
+
+    code = result.get("data", {}).get("code")
+
+    if code in (100, 101):
+        payment.is_paid = True
+        payment.ref_id = str(result["data"].get("ref_id", ""))
+        payment.save()
+        return HttpResponse("Payment verified successfully.")
+
+    return HttpResponse("Payment verification failed.")
